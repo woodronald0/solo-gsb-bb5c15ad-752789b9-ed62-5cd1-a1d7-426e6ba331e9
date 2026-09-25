@@ -763,8 +763,9 @@ envelope["signature"] = hmac.new(
    → `401 timestamp_skew`（响应附带 `server_time` 与 `max_skew_seconds`）；
 3. `key_id` 在密钥表中不存在 → `401 unknown_key_id`；
 4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
-5. 在**同一把锁内**依次完成 nonce 处理：先清理所有已过期 nonce → 再识别
-   重放 → 最后为新 nonce 预留名额：
+5. 在**同一把锁内**依次完成 nonce 处理：先按**到期时间索引**清理已到期
+   nonce（索引按到期时间推进，每次只从头部弹出已到期条目，不扫描未过期
+   nonce）→ 再识别重放 → 最后为新 nonce 预留名额：
    - 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
      → `409 nonce_replayed`（即使容量已满，重放仍优先返回 `409`）；
    - 防重放表达到 `SECURE_REQUEST_NONCE_CAPACITY`（进行中占位与已成功
@@ -777,7 +778,9 @@ envelope["signature"] = hmac.new(
 只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
 重试。回滚只删除请求自己的占位：若该占位恰好已过期并被并发请求重新占用，
-原有记录不会被误删。重放已成功的 nonce 返回 `409`。
+原有记录不会被误删。到期索引中的每条条目同样携带占位令牌：占位被释放
+或同名 nonce 到期后被重新占用时，遗留的索引条目在弹出时会因与主表记录
+不符而被直接丢弃，不会误删新占位。重放已成功的 nonce 返回 `409`。
 
 ### `POST /safe-download-name`
 
