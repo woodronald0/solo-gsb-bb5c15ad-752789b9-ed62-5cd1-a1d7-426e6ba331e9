@@ -6,7 +6,9 @@
 - 重放返回 409 nonce_replayed，且在防重放表已满时 409 仍优先于 503；
 - 容量对进行中占位与窗口内已成功 nonce 统一计数；容量已满且无过期项时
   返回 503 nonce_capacity_exceeded（附 capacity），不驱逐未过期 nonce、
-  不执行 payload；过期项在同一把锁内清理后可自动腾出名额；
+  不执行 payload；过期项在同一把锁内沿到期索引清理后可自动腾出名额；
+- 到期索引只弹出已到期条目，不扫描未过期 nonce；索引中失败回滚/同名
+  重占遗留的旧条目凭占位令牌识别并跳过，绝不误删新占位；
 - payload/业务失败（422）释放请求自身占位，可用同一 nonce 重试；
 - 释放占位时若该记录已过期并被并发请求重新占用，不能误删新记录；
 - SECURE_REQUEST_NONCE_CAPACITY 默认 10000 且必须为正整数。
@@ -17,6 +19,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import hmac
 import json
 import os
@@ -28,10 +31,12 @@ import uuid
 from app import main
 from app.main import (
     SecureRequestConfig,
+    _nonce_index,
     _nonce_lock,
     _nonce_seen,
     _release_nonce,
     _reserve_nonce,
+    _sweep_nonces,
     app,
 )
 
@@ -75,6 +80,7 @@ class SecureRequestTests(unittest.TestCase):
         main.secure_config.nonce_ttl = 600
         with _nonce_lock:
             _nonce_seen.clear()
+            _nonce_index.clear()
 
     def tearDown(self) -> None:
         main.secure_config.keys = self._orig_keys
@@ -82,6 +88,7 @@ class SecureRequestTests(unittest.TestCase):
         main.secure_config.nonce_ttl = self._orig_ttl
         with _nonce_lock:
             _nonce_seen.clear()
+            _nonce_index.clear()
 
     def _envelope(
         self,
@@ -111,12 +118,15 @@ class SecureRequestTests(unittest.TestCase):
         )
 
     def _fill_table(self, count: int, *, ttl: float = 300.0) -> list[str]:
-        """直接向防重放表写入 count 条未过期记录，返回占用的 nonce。"""
+        """直接向防重放表写入 count 条记录并登记到期索引，返回占用的 nonce。"""
         nonces = [f"occupied-{i}-{uuid.uuid4().hex}" for i in range(count)]
         now = time.time()
         with _nonce_lock:
             for nonce in nonces:
-                _nonce_seen[(KEY_ID, nonce)] = (now + ttl, uuid.uuid4().int)
+                key = (KEY_ID, nonce)
+                token = uuid.uuid4().int
+                _nonce_seen[key] = (now + ttl, token)
+                heapq.heappush(_nonce_index, (now + ttl, key, token))
         return nonces
 
     # ------------------------------- 基本语义 -------------------------------
@@ -232,13 +242,14 @@ class SecureRequestTests(unittest.TestCase):
             self._post(self._envelope(dict(PLAN_PAYLOAD), nonce="late-X")).status_code,
             503,
         )
-        # 一条旧记录到期后被下一次请求在同一把锁内清理，腾出名额；
+        # 一条旧记录到期后被下一次请求在同一把锁内经到期索引清理，腾出名额；
         # 此前被 503 拒绝的 nonce 可重试成功。
         with _nonce_lock:
-            for key, (_expiry, _token) in list(_nonce_seen.items()):
+            for key, (_expiry, token) in list(_nonce_seen.items()):
                 if key != (KEY_ID, "in-flight-A"):
-                    expiry, token = _nonce_seen[key]
-                    _nonce_seen[key] = (time.time() - 1, token)  # 置为已过期
+                    expired_at = time.time() - 1
+                    _nonce_seen[key] = (expired_at, token)  # 置为已过期
+                    heapq.heappush(_nonce_index, (expired_at, key, token))
                     break
         retry = self._post(self._envelope(dict(PLAN_PAYLOAD), nonce="late-X"))
         self.assertEqual(retry.status_code, 200)
@@ -291,15 +302,119 @@ class SecureRequestTests(unittest.TestCase):
             _release_nonce((KEY_ID, "raced"), old)  # type: ignore[arg-type]
             self.assertEqual(_nonce_seen.get((KEY_ID, "raced")), new)
 
+        # 新占位到期后由其自己的索引条目清理；期间遗留的旧条目早已弹出。
+        with _nonce_lock:
+            _sweep_nonces(later + 601)
+            self.assertNotIn((KEY_ID, "raced"), _nonce_seen)
+
     def test_release_keeps_record_with_same_expiry_but_new_token(self) -> None:
         now = 20_000.0
         status, old = _reserve_nonce((KEY_ID, "raced2"), now)
         self.assertEqual(status, "reserved")
         # 极端情形：到期时间相同，仅占位令牌不同（记录被重新占用）。
         with _nonce_lock:
-            _nonce_seen[(KEY_ID, "raced2")] = (old[0], old[1] ^ 0xDEADBEEF)  # type: ignore[index]
+            new_token = old[1] ^ 0xDEADBEEF  # type: ignore[index]
+            _nonce_seen[(KEY_ID, "raced2")] = (old[0], new_token)
+            # 重新占用会像 _reserve_nonce 一样登记携带新令牌的索引条目。
+            heapq.heappush(_nonce_index, (old[0], (KEY_ID, "raced2"), new_token))
             _release_nonce((KEY_ID, "raced2"), old)  # type: ignore[arg-type]
             self.assertIn((KEY_ID, "raced2"), _nonce_seen)
+            # 到期清理时旧令牌条目被跳过，新令牌条目删除新占位——新占位
+            # 确实已到期，不存在“遗留条目删除未到期新占位”的情况。
+            _sweep_nonces(old[0])  # type: ignore[index]
+            self.assertNotIn((KEY_ID, "raced2"), _nonce_seen)
+
+    # --------------------- 到期索引的推进与遗留条目 -------------------------
+
+    def test_index_entry_registered_with_placeholder_token(self) -> None:
+        now = 30_000.0
+        status, reservation = _reserve_nonce((KEY_ID, "indexed"), now)
+        self.assertEqual(status, "reserved")
+        expiry, token = reservation  # type: ignore[misc]
+        with _nonce_lock:
+            self.assertEqual(_nonce_index[0], (expiry, (KEY_ID, "indexed"), token))
+            self.assertEqual(_nonce_seen[(KEY_ID, "indexed")], (expiry, token))
+            # 堆按到期时间有序：堆顶是最早到期的条目。
+            self.assertEqual(
+                [entry[0] for entry in _nonce_index],
+                sorted(entry[0] for entry in _nonce_index),
+            )
+
+    def test_sweep_advances_only_over_expired_entries(self) -> None:
+        # 混合到期时间填充：2 条已过期、1 条刚好到期（相等即过期）、1 条未过期。
+        now = 40_000.0
+        ttl = main.secure_config.nonce_ttl
+        specs = [
+            ("expired-a", now - ttl - 10),  # 已过期
+            ("expired-b", now - ttl),       # 刚好到期
+            ("fresh-a", now - ttl + 1),     # 还差 1 秒
+            ("fresh-b", now - ttl + 300),   # 远未到期
+        ]
+        for nonce, reserved_at in specs:
+            status, _r = _reserve_nonce((KEY_ID, nonce), reserved_at)
+            self.assertEqual(status, "reserved")
+        self.assertEqual(len(_nonce_seen), 4)
+
+        with _nonce_lock:
+            heap_before = len(_nonce_index)
+            _sweep_nonces(now)
+            # 只弹出了 2 条到期索引项，未过期的 2 条索引项原样保留。
+            self.assertEqual(len(_nonce_index), heap_before - 2)
+            self.assertNotIn((KEY_ID, "expired-a"), _nonce_seen)
+            self.assertNotIn((KEY_ID, "expired-b"), _nonce_seen)
+            self.assertIn((KEY_ID, "fresh-a"), _nonce_seen)
+            self.assertIn((KEY_ID, "fresh-b"), _nonce_seen)
+
+        # 时间再推进 1 秒：fresh-a 到期后被下一次清理，fresh-b 仍保留。
+        with _nonce_lock:
+            _sweep_nonces(now + 1)
+            self.assertNotIn((KEY_ID, "fresh-a"), _nonce_seen)
+            self.assertIn((KEY_ID, "fresh-b"), _nonce_seen)
+            self.assertEqual(len(_nonce_seen), 1)
+
+    def test_stale_entry_from_released_placeholder_is_skipped(self) -> None:
+        # 失败请求回滚占位后，其索引条目成为遗留项：到期弹出时记录已不存在，
+        # 必须跳过而不是报错，更不能影响其他 nonce 的预留与清理。
+        now = 50_000.0
+        ttl = main.secure_config.nonce_ttl
+        status, reservation = _reserve_nonce((KEY_ID, "rolled-back"), now)
+        self.assertEqual(status, "reserved")
+        with _nonce_lock:
+            _release_nonce((KEY_ID, "rolled-back"), reservation)  # type: ignore[arg-type]
+        self.assertNotIn((KEY_ID, "rolled-back"), _nonce_seen)
+
+        # 推进到遗留条目到期之后再预留新 nonce：清理弹出遗留项并跳过。
+        later = now + ttl + 1
+        status, _r = _reserve_nonce((KEY_ID, "next"), later)
+        self.assertEqual(status, "reserved")
+        with _nonce_lock:
+            self.assertNotIn((KEY_ID, "rolled-back"), _nonce_seen)
+            self.assertIn((KEY_ID, "next"), _nonce_seen)
+            # 遗留条目已被弹出，索引中只剩新占位自己的条目。
+            self.assertEqual(
+                [entry[1] for entry in _nonce_index], [(KEY_ID, "next")]
+            )
+
+    def test_stale_entry_after_reoccupation_never_deletes_new_placeholder(self) -> None:
+        # 旧占位过期、同名 nonce 重新占用：旧索引条目到期弹出时凭令牌识别为
+        # 遗留项并跳过，新占位在其自身到期前必须始终保留（含容量计数）。
+        now = 60_000.0
+        ttl = main.secure_config.nonce_ttl
+        status, old = _reserve_nonce((KEY_ID, "same-name"), now)
+        self.assertEqual(status, "reserved")
+        later = now + ttl + 1
+        status, new = _reserve_nonce((KEY_ID, "same-name"), later)
+        self.assertEqual(status, "reserved")
+        with _nonce_lock:
+            # 第二次预留的清理已经弹出旧条目；表中只有携带新令牌的新占位。
+            self.assertEqual(_nonce_seen[(KEY_ID, "same-name")], new)
+            self.assertEqual(
+                [entry for entry in _nonce_index if entry[1] == (KEY_ID, "same-name")],
+                [(new[0], (KEY_ID, "same-name"), new[1])],  # type: ignore[index]
+            )
+            # 新占位尚未到期：再清理一次也不得动它。
+            _sweep_nonces(later)
+            self.assertEqual(_nonce_seen.get((KEY_ID, "same-name")), new)
 
 
 class NonceCapacityConfigTests(unittest.TestCase):

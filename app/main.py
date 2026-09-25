@@ -36,8 +36,11 @@ operation（plan 或 assemble）、payload（即原接口请求体）、key_id�
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
 HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内防重放。
 防重放表为有界容量（进行中占位与窗口内已成功 nonce 合计，默认 10000）：
-同一把锁内先清理过期项、再识别重放、最后为新 nonce 预留名额；容量已满
-且无过期项时返回 503 nonce_capacity_exceeded，绝不驱逐未过期 nonce。
+同一把锁内先沿按到期时间推进的最小堆索引清理已到期项（只处理到期项，
+不扫描全部未过期 nonce）、再识别重放、最后为新 nonce 预留名额并登记
+索引；索引条目携带本次占位令牌，失败回滚或同名 nonce 到期重占后遗留的
+旧条目会在到期弹出时凭令牌识别并跳过，绝不删除新占位。容量已满且无
+到期项时返回 503 nonce_capacity_exceeded，绝不驱逐未过期 nonce。
 验签通过后执行对应操作并原样返回其响应；/plan 与 /assemble 本身不受影响。
 
 POST /multipart-parse 解析上游返回的 multipart/byteranges 完整响应体
@@ -109,6 +112,7 @@ import binascii
 import bisect
 import datetime
 import hashlib
+import heapq
 import hmac
 import json
 import os
@@ -186,18 +190,38 @@ class SecureRequestConfig:
 
 secure_config = SecureRequestConfig()
 
-# 进程内 nonce 防重放存储：(key_id, nonce) -> (到期时间戳, 占位令牌)。
-# 占位令牌随每次预留重新生成：失败请求只能释放自己的占位，避免在其占位
-# 过期后误删被并发请求重新占用（甚至已成功）的同名记录。
+# 进程内 nonce 防重放存储：
+# - _nonce_seen：(key_id, nonce) -> (到期时间戳, 占位令牌)。占位令牌随每次
+#   预留重新生成：失败请求只能释放自己的占位，避免在其占位过期后误删被并发
+#   请求重新占用（甚至已成功）的同名记录。
+# - _nonce_index：按到期时间推进的最小堆索引，条目为
+#   (到期时间戳, nonce_key, 占位令牌)。清理时沿堆顶推进，只弹出/删除已经
+#   到期的条目；单次预留至多处理到期项本身，绝不扫描全部未过期 nonce。
+#   占位释放（失败回滚）或记录被同名 nonce 重新占用时，旧堆条目不会被主动
+#   移除，而是在其到期弹出时凭占位令牌识别为遗留条目（stale）并跳过——
+#   遗留条目此时已不在表中或已属新占位，均不得删除新占位。
 _nonce_lock = threading.Lock()
 _nonce_seen: dict[tuple[str, str], tuple[float, int]] = {}
+_nonce_index: list[tuple[float, tuple[str, str], int]] = []
 
 
 def _sweep_nonces(now: float) -> None:
-    """清理已过期 nonce（调用方需持有 _nonce_lock）。"""
-    expired = [k for k, (expiry, _token) in _nonce_seen.items() if expiry <= now]
-    for k in expired:
-        del _nonce_seen[k]
+    """沿到期索引清理已过期 nonce（调用方需持有 _nonce_lock）。
+
+    堆顶是全局最早到期的条目：堆顶未到期则其余条目必然都未到期，可以
+    立即停止。弹出的每条到期索引项都凭 (nonce_key, 占位令牌) 与当前记录
+    核对——仅当二者逐字一致时才删除，以跳过：
+      - 失败回滚后遗留的旧索引项（记录已不存在）；
+      - 同名 nonce 到期后重新占用前的旧索引项（记录已属于新占位）。
+    因此清理复杂度只与“到期项数量”相关，与表内未过期 nonce 总数无关。
+    """
+    while _nonce_index:
+        expiry, nonce_key, token = _nonce_index[0]
+        if expiry > now:
+            break
+        heapq.heappop(_nonce_index)
+        if _nonce_seen.get(nonce_key) == (expiry, token):
+            del _nonce_seen[nonce_key]
 
 
 def _reserve_nonce(
@@ -205,11 +229,12 @@ def _reserve_nonce(
 ) -> tuple[str, tuple[float, int] | None]:
     """在同一把锁内完成防重放判断与名额预留（调用方需持有 _nonce_lock）。
 
-    顺序固定为：先清理过期项 → 再识别重放 → 最后为新 nonce 预留名额。
-    容量统计同时包含进行中的占位与窗口内已成功的 nonce；容量已满且没有
-    任何过期项可清理时返回 ``("full", None)``（调用方据此返回 503，绝不
-    驱逐未过期 nonce）；重放返回 ``("replayed", None)``（409 优先于 503）；
-    预留成功返回 ``("reserved", (到期时间戳, 占位令牌))``。
+    顺序固定为：先沿到期索引清理过期项 → 再识别重放 → 最后为新 nonce
+    预留名额（含堆索引登记）。容量统计同时包含进行中的占位与窗口内已成功
+    的 nonce；容量已满且没有任何过期项可清理时返回 ``("full", None)``
+    （调用方据此返回 503，绝不驱逐未过期 nonce）；重放返回
+    ``("replayed", None)``（409 优先于 503）；预留成功返回
+    ``("reserved", (到期时间戳, 占位令牌))``。
     """
     _sweep_nonces(now)
     if nonce_key in _nonce_seen:
@@ -220,6 +245,7 @@ def _reserve_nonce(
     expiry = now + secure_config.nonce_ttl
     reservation = (expiry, token)
     _nonce_seen[nonce_key] = reservation
+    heapq.heappush(_nonce_index, (expiry, nonce_key, token))
     return "reserved", reservation
 
 
@@ -228,8 +254,9 @@ def _release_nonce(
 ) -> None:
     """释放本次失败请求自己的占位（调用方需持有 _nonce_lock）。
 
-    仅当存储中的记录与本次预留（到期时间戳 + 占位令牌）逐字一致时才删除；
-    若该记录已过期并被并发请求重新占用，则保持不动。
+    仅当表中的记录与本次预留（到期时间戳 + 占位令牌）逐字一致时才删除；
+    若该记录已过期并被并发请求重新占用，则保持不动。对应的堆索引项不主动
+    摘除，留待其到期弹出时由 _sweep_nonces 凭令牌识别为遗留条目并跳过。
     """
     if _nonce_seen.get(nonce_key) == reservation:
         del _nonce_seen[nonce_key]
@@ -2674,11 +2701,13 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
         )
 
     # 4. nonce 防重放：同一 key_id+nonce 在有效窗口内只能成功一次。
-    #    在同一把锁内完成“清理过期项 → 识别重放 → 为新 nonce 预留名额”，
-    #    避免清理/判重/占位之间出现并发窗口。先占位；若后续 payload 校验或
-    #    操作执行失败则回滚，避免失败请求白白消耗 nonce（只有真正成功的
+    #    在同一把锁内完成“沿到期索引清理到期项 → 识别重放 → 为新 nonce
+    #    预留名额并登记索引”，避免清理/判重/占位之间出现并发窗口。清理只
+    #    沿最小堆堆顶弹出已经到期的索引项（不扫描全部未过期 nonce），旧占位
+    #    的遗留条目凭令牌识别、绝不误删新占位。先占位；若后续 payload 校验
+    #    或操作执行失败则回滚，避免失败请求白白消耗 nonce（只有真正成功的
     #    请求才永久占用）。容量对进行中占位与窗口内已成功 nonce 统一计数，
-    #    已满且无过期项时拒绝执行（503），绝不驱逐任何未过期 nonce；
+    #    已满且无到期项时拒绝执行（503），绝不驱逐任何未过期 nonce；
     #    409 重放优先于 503 容量不足。
     nonce_key = (raw.key_id, raw.nonce)
     with _nonce_lock:

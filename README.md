@@ -32,8 +32,11 @@
 - `POST /secure-request`：上述两个操作的**统一鉴权入口**。请求携带 `operation`
   （`plan` 或 `assemble`）、`payload`（原接口请求体）以及 `key_id` / `timestamp`
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
-  密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。验签通过后
-  执行对应操作并**原样返回该操作的响应**。`/plan` 与 `/assemble` 行为不受影响。
+  密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。防重放表
+  配有按到期时间推进的最小堆索引：清理只处理已到期条目、不扫描全部未过期
+  nonce，索引条目与占位令牌关联，失败回滚或同名 nonce 到期重占后的遗留条目
+  凭令牌跳过、绝不误删新占位。验签通过后执行对应操作并**原样返回该操作的
+  响应**。`/plan` 与 `/assemble` 行为不受影响。
 - `POST /safe-download-name`：解析上游 `Content-Disposition` 响应头，返回可
   直接用作本地下载文件名的**单一安全名称**。优先采用符合 RFC 5987 的
   `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
@@ -119,7 +122,7 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 | `SECURE_REQUEST_KEYS` | 使用 `/secure-request` 时必需 | 空 | 逗号分隔的 `key_id=secret` 列表，`secret` 为原始 UTF-8 密钥字节（建议使用 32 字节随机值的 hex/base64 文本，避免出现 `,` 与 `=`） |
 | `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
 | `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
-| `SECURE_REQUEST_NONCE_CAPACITY` | 否 | `10000` | 进程内 nonce 防重放表的容量上限（正整数）；**进行中占位与窗口内已成功 nonce 统一计数**，容量已满且无过期项可清理时返回 `503 nonce_capacity_exceeded`（附 `capacity`），不会驱逐任何未过期 nonce |
+| `SECURE_REQUEST_NONCE_CAPACITY` | 否 | `10000` | 进程内 nonce 防重放表的容量上限（正整数）；**进行中占位与窗口内已成功 nonce 统一计数**，容量已满且无到期项可清理时返回 `503 nonce_capacity_exceeded`（附 `capacity`），不会驱逐任何未过期 nonce。到期记录由按到期时间推进的最小堆索引在每次预留时顺带清理，单次只处理到期项、不扫描全部未过期 nonce |
 
 未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble`、
 `/range-response` 等端点仍正常工作，但 `/secure-request` 返回
@@ -763,8 +766,10 @@ envelope["signature"] = hmac.new(
    → `401 timestamp_skew`（响应附带 `server_time` 与 `max_skew_seconds`）；
 3. `key_id` 在密钥表中不存在 → `401 unknown_key_id`；
 4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
-5. 在**同一把锁内**依次完成 nonce 处理：先清理所有已过期 nonce → 再识别
-   重放 → 最后为新 nonce 预留名额：
+5. 在**同一把锁内**依次完成 nonce 处理：先沿按到期时间推进的最小堆索引
+   清理已到期 nonce（堆顶未到期即停止，单次预留只弹出/处理到期条目本身，
+   **不扫描全部未过期 nonce**）→ 再识别重放 → 最后为新 nonce 预留名额并
+   登记到期索引（索引条目携带本次占位令牌）：
    - 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
      → `409 nonce_replayed`（即使容量已满，重放仍优先返回 `409`）；
    - 防重放表达到 `SECURE_REQUEST_NONCE_CAPACITY`（进行中占位与已成功
@@ -777,7 +782,9 @@ envelope["signature"] = hmac.new(
 只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
 重试。回滚只删除请求自己的占位：若该占位恰好已过期并被并发请求重新占用，
-原有记录不会被误删。重放已成功的 nonce 返回 `409`。
+原有记录不会被误删。失败回滚（或同名 nonce 到期后重新占用）留在到期索引
+中的旧条目不立即摘除，而是在其到期弹出时凭占位令牌识别为遗留条目并跳过——
+**遗留条目绝不删除新占位**。重放已成功的 nonce 返回 `409`。
 
 ### `POST /safe-download-name`
 
